@@ -1,4 +1,4 @@
-# biomass-pyrolysis--CNN-PI-DeepONet
+# biomass-pyrolysis--CNN+PI-DeepONet
 
 
 This repository contains the complete code associated with the study:
