@@ -1,5 +1,5 @@
 # biomass-pyrolysis--CNN-PI-DeepONet
-# Hybrid Physics-Informed Machine Learning Framework for Biomass Pyrolysis Kinetics
+
 
 This repository contains the complete code associated with the study:
 
