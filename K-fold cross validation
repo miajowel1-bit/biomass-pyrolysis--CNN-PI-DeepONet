@@ -1,0 +1,542 @@
+# Grouped 5-fold cross-validation over parameter sets 
+
+import os
+import json
+import time
+import numpy as np
+import pandas as pd
+import torch
+import torch.nn as nn
+
+# --------------------------- SETTINGS ---------------------------
+CV_N_FOLDS = 5
+CV_SEED = 42
+CV_SMOKE_TEST = False        # True: fold 1 only, 1 forward + 2 inverse epochs, separate output folder. DO THIS FIRST.
+CV_FOLDS_TO_RUN = None       # e.g. [0, 1] to run a subset; None = all folds
+CV_FORWARD_EPOCHS = 11       # notebook EPOCHS (forward)
+CV_INVERSE_EPOCHS = 100      # notebook EPOCHS (inverse)
+CV_FWD_BATCH = 4096
+CV_INV_BATCH = 2048
+CV_LAMBDA_PHYS = 1e-5
+CV_LAMBDA_IC = 0.1
+CV_DATA_ON_GPU = True
+CV_USE_COMPILE = False       
+CV_RESUME = False            
+
+CV_CODE_VERSION = "kfold-v3" 
+CV_ADD_REFERENCE_ROW = True  
+
+if CV_SMOKE_TEST:
+    CV_FORWARD_EPOCHS, CV_INVERSE_EPOCHS, CV_FOLDS_TO_RUN = 1, 2, [0]
+
+# ---------------------- INPUT VALIDATION ----------------------
+_cv_required = ["ForwardDeepONet", "InverseNet", "total_inverse_loss", "curriculum_weights", "device", "SAVE_DIR"]
+_cv_missing = [n for n in _cv_required if n not in globals()]
+if _cv_missing:
+    raise NameError(f"Run the notebook cells that define these first: {_cv_missing}")
+CV_DATA_PATH = DATA_PATH if "DATA_PATH" in globals() else "/content/drive/MyDrive/Forward_PI_DeepONet/forward_dataset_canonical.npz"
+CV_DIR = os.path.join(SAVE_DIR, "kfold_grouped_5fold" + ("_SMOKE" if CV_SMOKE_TEST else ""))
+CV_T_REF_K = (float(np.mean(TEMP_WINDOW)) if "TEMP_WINDOW" in globals() else 650.0) + 273.15
+CV_R_GAS = 8.314
+CV_DATA_DEVICE = device if CV_DATA_ON_GPU else torch.device("cpu")
+
+CV_TABLE_COLS = [
+    ("fwd_alpha_RMSE", "Forward alpha RMSE"),
+    ("recon_exact_RMSE", "Inverse: exact-DAEM curve RMSE"),
+    ("recon_fwd_RMSE", "Inverse: DeepONet curve RMSE"),
+    ("inv_logA_RMSE", "logA RMSE"),
+    ("inv_E_kJ_mol_RMSE", "E RMSE (kJ/mol)"),
+    ("inv_c_RMSE", "c RMSE"),
+    ("inv_lnk_Tref_RMSE", "ln k(T_ref) RMSE"),
+    ("inv_logA_MAE", "logA MAE"),
+    ("inv_E_kJ_mol_MAE", "E MAE (kJ/mol)"),
+    ("inv_c_MAE", "c MAE"),
+]
+
+
+# ---------------------- PURE NUMPY HELPERS (unit-tested) ----------------------
+def cv_make_group_ids(branch):
+    """One id per unique 9-parameter vector, exactly as the notebook's grouped inverse split does."""
+    branch = np.ascontiguousarray(branch)
+    keys = branch.view(np.dtype((np.void, branch.dtype.itemsize * branch.shape[1]))).reshape(-1)
+    unique_keys, group_ids = np.unique(keys, return_inverse=True)
+    return len(unique_keys), np.asarray(group_ids).reshape(-1)
+
+
+def cv_assign_folds(n_groups, n_folds, seed):
+    """Random, balanced assignment of parameter sets (groups) to folds."""
+    if n_groups < n_folds:
+        raise ValueError(f"Only {n_groups} parameter sets for {n_folds} folds.")
+    perm = np.random.default_rng(seed).permutation(n_groups)
+    fold_of_group = np.empty(n_groups, dtype=np.int64)
+    fold_of_group[perm] = np.arange(n_groups) % n_folds
+    return fold_of_group
+
+
+def cv_beta_index(trunk_norm):
+    """Representative curve index per unique beta and a beta id per curve (as in the notebook), with a
+    check that curves sharing a beta really share the same trunk grid."""
+    ub, first, inv = np.unique(trunk_norm[:, 0, 1], return_index=True, return_inverse=True)
+    inv = np.asarray(inv).reshape(-1)
+    chk = np.random.default_rng(0).choice(len(trunk_norm), size=min(2000, len(trunk_norm)), replace=False)
+    if not np.allclose(trunk_norm[chk], trunk_norm[first[inv[chk]]], atol=1e-6):
+        raise ValueError("Curves with the same beta do not share the same trunk grid; unique-beta basis is invalid.")
+    return first, inv.astype(np.int64)
+
+
+class _CvAcc:
+    """Streaming SSE / SAE / R2 for arrays (numpy or torch)."""
+    def __init__(self):
+        self.sse = self.sae = self.sy = self.syy = 0.0
+        self.n = 0
+
+    @staticmethod
+    def _np(x):
+        if hasattr(x, "detach"):
+            x = x.detach().cpu().numpy()
+        return np.asarray(x, dtype=np.float64)
+
+    def add(self, pred, true):
+        p, t = self._np(pred), self._np(true)
+        d = p - t
+        self.sse += float(np.sum(d * d)); self.sae += float(np.sum(np.abs(d)))
+        self.sy += float(np.sum(t)); self.syy += float(np.sum(t * t)); self.n += d.size
+
+    def rmse(self): return float(np.sqrt(self.sse / self.n))
+    def mae(self): return float(self.sae / self.n)
+    def r2(self):
+        sst = self.syy - self.sy ** 2 / self.n
+        return float(1.0 - self.sse / sst) if sst > 0 else float("nan")
+
+
+def cv_param_metrics(true_phys, pred_phys, group_ids=None):
+    """Parameter errors in PHYSICAL units (logA, E in kJ/mol, c, and ln k at T_ref).
+    Curve level (one prediction per curve) and, if group_ids is given, set level (predictions averaged over
+    the heating rates of one parameter set, which mirrors how the real-data pipeline averages the CNN)."""
+    tp, pp = np.asarray(true_phys, np.float64), np.asarray(pred_phys, np.float64)
+    slots = {"logA": [0, 3, 6], "E_kJ_mol": [1, 4, 7], "c": [2, 5, 8]}
+
+    def block(t, p, prefix):
+        e = p - t
+        out = {}
+        for name, idx in slots.items():
+            out[f"{prefix}{name}_RMSE"] = float(np.sqrt(np.mean(e[:, idx] ** 2)))
+            out[f"{prefix}{name}_MAE"] = float(np.mean(np.abs(e[:, idx])))
+        dlnk = np.log(10.0) * e[:, slots["logA"]] - e[:, slots["E_kJ_mol"]] * 1000.0 / (CV_R_GAS * CV_T_REF_K)
+        out[f"{prefix}lnk_Tref_RMSE"] = float(np.sqrt(np.mean(dlnk ** 2)))
+        return out
+
+    out = block(tp, pp, "")
+    if group_ids is not None:
+        g, inv = np.unique(group_ids, return_inverse=True)
+        inv = np.asarray(inv).reshape(-1)
+        cnt = np.bincount(inv)[:, None].astype(np.float64)
+        pm = np.zeros((len(g), 9)); tm = np.zeros((len(g), 9))
+        np.add.at(pm, inv, pp); np.add.at(tm, inv, tp)
+        out.update(block(tm / cnt, pm / cnt, "setavg_"))
+    return out
+
+
+def cv_summarize(rows):
+    """Per-fold table plus mean and SD (ddof=1) rows."""
+    df = pd.DataFrame(rows).sort_values("fold").reset_index(drop=True)
+    num = df.select_dtypes(include=[np.number]).drop(columns=["fold"], errors="ignore")
+    mean_row = {"fold": "mean", **num.mean().to_dict()}
+    sd_row = {"fold": "SD", **(num.std(ddof=1) if len(df) > 1 else num.std(ddof=0)).to_dict()}
+    return df, pd.concat([df.astype({"fold": object}), pd.DataFrame([mean_row, sd_row])], ignore_index=True)
+
+
+def cv_validate_dataset(branch, trunk, alpha, path=""):
+    """Fail loudly if the file is not the canonical PHYSICAL forward dataset (e.g. the old processed / z-scored one)."""
+    p = []
+    if branch.ndim != 2 or branch.shape[1] != 9: p.append(f"branch shape {branch.shape}, expected (N, 9)")
+    if trunk.ndim != 3 or trunk.shape[2] != 2: p.append(f"trunk shape {trunk.shape}, expected (N, T, 2)")
+    if alpha.ndim != 2: p.append(f"alpha shape {alpha.shape}, expected (N, T)")
+    if p:
+        raise ValueError(f"{path}: " + "; ".join(p))
+    if not (len(branch) == len(trunk) == len(alpha)) or alpha.shape != trunk.shape[:2]:
+        raise ValueError(f"{path}: inconsistent shapes branch {branch.shape}, trunk {trunk.shape}, alpha {alpha.shape}")
+    if not (np.isfinite(branch).all() and np.isfinite(trunk).all() and np.isfinite(alpha).all()):
+        p.append("contains NaN/Inf")
+    logA, E, c = branch[:, [0, 3, 6]], branch[:, [1, 4, 7]], branch[:, [2, 5, 8]]
+    if logA.min() < 9.5 or logA.max() > 17.5: p.append(f"logA range [{logA.min():.3g}, {logA.max():.3g}] is not ~[10, 17]")
+    if E.min() < 150 or E.max() > 400: p.append(f"E range [{E.min():.3g}, {E.max():.3g}] is not ~[180, 380] kJ/mol")
+    if c.min() < -1e-6 or c.max() > 1 + 1e-6 or np.abs(c.sum(1) - 1).max() > 1e-3: p.append("c is not a probability vector (sum != 1)")
+    if alpha.min() < -1e-3 or alpha.max() > 1 + 1e-3: p.append(f"alpha range [{alpha.min():.3g}, {alpha.max():.3g}] is not within [0, 1]")
+    if trunk[:, :, 1].min() <= 0 or trunk[:, :, 1].max() > 200: p.append("beta (trunk[:, :, 1]) is not a physical heating rate")
+    if trunk[:, :, 0].min() < -1e-6: p.append("time (trunk[:, :, 0]) is negative")
+    if np.all(np.abs(branch.mean(0)) < 0.2) and np.all(np.abs(branch.std(0) - 1.0) < 0.2):
+        p.append("branch looks z-scored (mean ~0, SD ~1) rather than physical")
+    if p:
+        raise ValueError(f"{path} is not the canonical physical dataset: " + "; ".join(p) +
+                         ". Point DATA_PATH at forward_dataset_canonical.npz.")
+
+
+def cv_fingerprint(n_curves, n_groups, fold_of_group, data_path):
+    """Everything that must be identical for an old fold result to be reusable."""
+    import hashlib
+    return {"code_version": CV_CODE_VERSION, "n_folds": CV_N_FOLDS, "seed": CV_SEED,
+            "forward_epochs": CV_FORWARD_EPOCHS, "inverse_epochs": CV_INVERSE_EPOCHS,
+            "fwd_batch": CV_FWD_BATCH, "inv_batch": CV_INV_BATCH, "lambda_phys": CV_LAMBDA_PHYS,
+            "lambda_ic": CV_LAMBDA_IC, "n_curves": int(n_curves), "n_groups": int(n_groups),
+            "fold_hash": hashlib.md5(np.ascontiguousarray(fold_of_group).tobytes()).hexdigest(),
+            "data_file": os.path.basename(str(data_path)), "t_ref_C": round(CV_T_REF_K - 273.15, 6)}
+
+
+def cv_fold_path(k, name):
+    """All fold files live in CV_DIR/fold_N/ and carry 'kfold' in their name."""
+    return os.path.join(CV_DIR, f"fold_{k + 1}", f"kfold_fold{k + 1}_{name}")
+
+
+def cv_plot_histories(folds):
+    """Training loss per epoch for every fold (forward and inverse). No held-out curve: the held-out fold is
+    deliberately not evaluated during training."""
+    import matplotlib.pyplot as plt
+    hist = {}
+    for f in folds:
+        pth = cv_fold_path(int(f) - 1, "history.json")
+        if os.path.isfile(pth):
+            with open(pth) as fh:
+                hist[int(f)] = json.load(fh)
+    if not hist:
+        return None
+    fig, axes = plt.subplots(1, 2, figsize=(11, 4))
+    for ax, key, title in ((axes[0], "forward_train_loss", "Forward DeepONet"), (axes[1], "inverse_train_loss", "Inverse CNN")):
+        for f, h in sorted(hist.items()):
+            ax.plot(range(1, len(h[key]) + 1), h[key], label=f"fold {f}")
+        ax.set_yscale("log"); ax.set_xlabel("Epoch"); ax.set_ylabel("Training loss (total)")
+        ax.set_title(title); ax.legend()
+    fig.tight_layout()
+    out = os.path.join(CV_DIR, "kfold_training_loss_per_fold.png")
+    fig.savefig(out, dpi=300)
+    plt.close(fig)
+    return out
+
+
+# ---------------------- TORCH PARTS (copied from the notebook recipe) ----------------------
+def cv_daem_alpha(branch_phys, trunk_phys):
+    """Exact discrete DAEM on the trunk grid; identical to the alpha_daem computation in daem_residual_loss."""
+    t = trunk_phys[:, :, 0]
+    beta = trunk_phys[:, :, 1]
+    logA = branch_phys[:, [0, 3, 6]]
+    E = branch_phys[:, [1, 4, 7]] * 1000.0
+    c = branch_phys[:, [2, 5, 8]]
+    A = (10.0 ** logA).unsqueeze(1)
+    E = E.unsqueeze(1)
+    c = c.unsqueeze(1)
+    T = 273.15 + beta.unsqueeze(-1) * t.unsqueeze(-1)
+    k = A * torch.exp(-E / (CV_R_GAS * T))
+    dt = t[:, 1:] - t[:, :-1]
+    integ = torch.cumsum(0.5 * (k[:, 1:, :] + k[:, :-1, :]) * dt.unsqueeze(-1), dim=1)
+    integ = torch.cat([torch.zeros_like(integ[:, :1, :]), integ], dim=1)
+    return torch.sum(c * (1.0 - torch.exp(-integ)), dim=-1)
+
+
+def cv_daem_residual_loss(alpha_pred, branch_norm, trunk_norm, st):
+    """Notebook daem_residual_loss, but de-normalising with THIS fold's statistics (st), not notebook globals."""
+    alpha_pred = alpha_pred.squeeze(-1)
+    branch_phys = branch_norm * st["bs"] + st["bm"]
+    trunk_phys = trunk_norm * st["ts"] + st["tm"]
+    alpha_daem = cv_daem_alpha(branch_phys, trunk_phys)
+    t = trunk_phys[:, :, 0]
+    dt = t[:, 1:] - t[:, :-1]
+    d_pred = (alpha_pred[:, 1:] - alpha_pred[:, :-1]) / (dt + 1e-8)
+    d_daem = (alpha_daem[:, 1:] - alpha_daem[:, :-1]) / (dt + 1e-8)
+    return torch.mean((d_pred - d_daem) ** 2)
+
+
+def cv_set_seed(seed):
+    import random
+    random.seed(seed); np.random.seed(seed); torch.manual_seed(seed); torch.cuda.manual_seed_all(seed)
+
+
+def cv_train_forward(bn, tn, al, st, seed):
+    """Physics-informed forward DeepONet, same recipe as notebook CELL 6 (no best-epoch selection)."""
+    cv_set_seed(seed)
+    model = ForwardDeepONet().to(device)
+    mse = nn.MSELoss()
+    opt = torch.optim.AdamW(model.parameters(), lr=1e-3, weight_decay=1e-5)
+    sched = torch.optim.lr_scheduler.ReduceLROnPlateau(opt, mode="min", factor=0.5, patience=10)
+    n = bn.shape[0]
+    n_batches = int(np.ceil(n / CV_FWD_BATCH))
+    last, history = float("nan"), []
+    for epoch in range(CV_FORWARD_EPOCHS):
+        model.train()
+        perm = torch.randperm(n, device=bn.device)
+        running = torch.zeros((), device=device)
+        for i in range(0, n, CV_FWD_BATCH):
+            idx = perm[i:i + CV_FWD_BATCH]
+            b, t = bn[idx].to(device), tn[idx].to(device)
+            a = al[idx].to(device).unsqueeze(-1)
+            opt.zero_grad(set_to_none=True)
+            pred = model(b, t)
+            loss = (mse(pred, a) + CV_LAMBDA_PHYS * cv_daem_residual_loss(pred, b, t, st)
+                    + CV_LAMBDA_IC * mse(pred[:, 0, :], torch.zeros_like(pred[:, 0, :])))
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+            opt.step()
+            running = running + loss.detach()
+        last = float(running) / n_batches
+        history.append(last)
+        sched.step(last)
+        print(f"    forward epoch {epoch + 1}/{CV_FORWARD_EPOCHS} train loss {last:.4e}")
+    model.eval()
+    for p in model.parameters():
+        p.requires_grad = False
+    return model, history
+
+
+class CvInverseNet(InverseNet):
+    """Your notebook InverseNet, unchanged except for one line type: under AMP the heads return float16 while
+    `branch_phys` is float32, and EAGER PyTorch refuses `branch_phys[:, idx] = half_tensor`
+    ("Index put requires the source and destination dtypes match"). Your original training ran through
+    torch.compile, which silently casts the values to the destination dtype; this does the same cast explicitly,
+    so the maths is identical and the state_dict keys are identical (weights load into InverseNet)."""
+    def forward(self, trunk_norm, alpha):
+        x = torch.cat([trunk_norm, alpha.unsqueeze(-1)], dim=-1).permute(0, 2, 1)
+        x = self.stem(x)
+        x = self.res_blocks(x)
+        x = self.attn(x)
+        z = torch.cat([self.avg_pool(x).flatten(1), self.max_pool(x).flatten(1)], dim=1)
+        z = self.shared_fc(z)
+        logA = self.logA_min + (self.logA_max - self.logA_min) * torch.sigmoid(self.head_logA(z))
+        E = self.E_min + (self.E_max - self.E_min) * torch.sigmoid(self.head_E(z))
+        c = torch.softmax(self.head_c(z), dim=1)
+        branch_phys = torch.zeros(alpha.shape[0], 9, dtype=alpha.dtype, device=alpha.device)
+        branch_phys[:, [0, 3, 6]] = logA.to(branch_phys.dtype)
+        branch_phys[:, [1, 4, 7]] = E.to(branch_phys.dtype)
+        branch_phys[:, [2, 5, 8]] = c.to(branch_phys.dtype)
+        branch_norm = (branch_phys - self.branch_mean) / self.branch_std
+        return branch_norm, branch_phys
+
+
+def cv_train_inverse(fwd, bn, tn, al, bid, basis, bm, bs, seed):
+    """Inverse CNN, same recipe as notebook CELL 6B with the fold's frozen forward model (no best-epoch selection)."""
+    cv_set_seed(seed)
+    inv = CvInverseNet(branch_mean=bm, branch_std=bs, n_time=al.shape[1]).to(device)
+    if CV_USE_COMPILE:
+        try:
+            inv = torch.compile(inv)
+        except Exception as exc:
+            print("    torch.compile skipped:", exc)
+    use_amp = device.type == "cuda"
+    opt = torch.optim.AdamW(inv.parameters(), lr=1e-3, weight_decay=1e-5)
+    sched = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=CV_INVERSE_EPOCHS, eta_min=1e-5)
+    scaler = torch.amp.GradScaler("cuda", enabled=use_amp)
+    n = bn.shape[0]
+    n_batches = int(np.ceil(n / CV_INV_BATCH))
+    last, history = float("nan"), []
+    for epoch in range(1, CV_INVERSE_EPOCHS + 1):
+        lam_recon, lam_branch, lam_mono, lam_c = curriculum_weights(epoch, CV_INVERSE_EPOCHS)
+        inv.train()
+        perm = torch.randperm(n, device=bn.device)
+        running = torch.zeros((), device=device)
+        for i in range(0, n, CV_INV_BATCH):
+            idx = perm[i:i + CV_INV_BATCH]
+            trunk_norm, alpha_true = tn[idx].to(device), al[idx].to(device)
+            branch_true_norm = bn[idx].to(device)
+            trunk_basis = basis[bid[idx].to(device)]
+            opt.zero_grad(set_to_none=True)
+            with torch.amp.autocast("cuda", enabled=use_amp):
+                branch_pred_norm, branch_pred_phys = inv(trunk_norm, alpha_true)
+                alpha_recon = torch.sigmoid(
+                    torch.einsum("bi,bni->bn", fwd.branch(branch_pred_norm), trunk_basis) + fwd.bias)
+                loss, _, _, _, _ = total_inverse_loss(
+                    branch_pred_norm, branch_pred_phys, branch_true_norm, alpha_recon, alpha_true,
+                    lambda_recon=lam_recon, lambda_branch=lam_branch, lambda_mono=lam_mono, lambda_c=lam_c)
+            scaler.scale(loss).backward()
+            scaler.unscale_(opt)
+            torch.nn.utils.clip_grad_norm_(inv.parameters(), max_norm=1.0)
+            scaler.step(opt)
+            scaler.update()
+            running = running + loss.detach()
+        sched.step()
+        last = float(running) / n_batches
+        history.append(last)
+        if epoch == 1 or epoch % 10 == 0 or epoch == CV_INVERSE_EPOCHS:
+            print(f"    inverse epoch {epoch}/{CV_INVERSE_EPOCHS} train loss {last:.4e}")
+    inv.eval()
+    return inv, history
+
+
+def cv_unique_basis(fwd, tn_np, first):
+    with torch.no_grad():
+        rep = torch.as_tensor(tn_np[first], dtype=torch.float32, device=device)
+        nb, nt, _ = rep.shape
+        return fwd.trunk(rep.reshape(-1, 2)).reshape(nb, nt, -1)
+
+
+def cv_run_fold(k):
+    t_start = time.time()
+    fold_dir = os.path.join(CV_DIR, f"fold_{k + 1}")
+    os.makedirs(fold_dir, exist_ok=True)
+    te_idx = np.where(cv_fold_of_curve == k)[0]
+    tr_idx = np.where(cv_fold_of_curve != k)[0]
+    g_tr, g_te = np.unique(cv_group_ids[tr_idx]), np.unique(cv_group_ids[te_idx])
+    if len(np.intersect1d(g_tr, g_te)) != 0:
+        raise AssertionError("Parameter-set leakage between train and held-out folds.")
+    print(f"\n=== Fold {k + 1}/{CV_N_FOLDS}: train {len(g_tr)} sets / {len(tr_idx)} curves | "
+          f"held-out {len(g_te)} sets / {len(te_idx)} curves ===")
+
+    b_tr, t_tr, a_tr = cv_branch[tr_idx], cv_trunk[tr_idx], cv_alpha[tr_idx]
+    b_te, t_te, a_te = cv_branch[te_idx], cv_trunk[te_idx], cv_alpha[te_idx]
+    # normalisation statistics from this fold's TRAINING curves only (same formulas as notebook CELL 4)
+    bm, bs = b_tr.mean(axis=0), b_tr.std(axis=0) + 1e-8
+    tm, ts = t_tr.mean(axis=(0, 1)), t_tr.std(axis=(0, 1)) + 1e-8
+    bn_tr, bn_te = ((b_tr - bm) / bs).astype(np.float32), ((b_te - bm) / bs).astype(np.float32)
+    tn_tr, tn_te = ((t_tr - tm) / ts).astype(np.float32), ((t_te - tm) / ts).astype(np.float32)
+    st = {n: torch.as_tensor(v, dtype=torch.float32, device=device) for n, v in
+          (("bm", bm), ("bs", bs), ("tm", tm), ("ts", ts))}
+
+    dd = CV_DATA_DEVICE
+    to_dd = lambda x: torch.as_tensor(x, dtype=torch.float32, device=dd)
+    T_bn_tr, T_tn_tr, T_al_tr = to_dd(bn_tr), to_dd(tn_tr), to_dd(a_tr)
+
+    print("  forward DeepONet")
+    fwd, fwd_hist = cv_train_forward(T_bn_tr, T_tn_tr, T_al_tr, st, seed=CV_SEED + 1000 + k)
+
+    # held-out forward accuracy (grouped, so the held-out parameter sets were never seen)
+    acc_fwd = _CvAcc()
+    T_bn_te, T_tn_te, T_al_te = to_dd(bn_te), to_dd(tn_te), to_dd(a_te)
+    with torch.no_grad():
+        for i in range(0, len(te_idx), CV_FWD_BATCH):
+            sl = slice(i, i + CV_FWD_BATCH)
+            pred = fwd(T_bn_te[sl].to(device), T_tn_te[sl].to(device)).squeeze(-1)
+            acc_fwd.add(pred, T_al_te[sl].to(device))
+
+    print("  inverse CNN (uses this fold's frozen forward model)")
+    first_tr, bid_tr_np = cv_beta_index(tn_tr)
+    first_te, bid_te_np = cv_beta_index(tn_te)
+    basis_tr, basis_te = cv_unique_basis(fwd, tn_tr, first_tr), cv_unique_basis(fwd, tn_te, first_te)
+    inv, inv_hist = cv_train_inverse(fwd, T_bn_tr, T_tn_tr, T_al_tr,
+                                     torch.as_tensor(bid_tr_np, dtype=torch.long, device=dd),
+                                     basis_tr, bm, bs, seed=CV_SEED + 2000 + k)
+
+    # held-out inverse accuracy: final epoch, all held-out curves
+    bid_te = torch.as_tensor(bid_te_np, dtype=torch.long, device=dd)
+    T_t_te_phys = to_dd(t_te)
+    acc_rf, acc_re, preds = _CvAcc(), _CvAcc(), []
+    with torch.no_grad():
+        for i in range(0, len(te_idx), CV_INV_BATCH):
+            sl = slice(i, i + CV_INV_BATCH)
+            trunk_norm, alpha_true = T_tn_te[sl].to(device), T_al_te[sl].to(device)
+            bp_norm, bp_phys = inv(trunk_norm, alpha_true)
+            recon = torch.sigmoid(torch.einsum("bi,bni->bn", fwd.branch(bp_norm),
+                                               basis_te[bid_te[sl].to(device)]) + fwd.bias)
+            exact = cv_daem_alpha(bp_phys.float(), T_t_te_phys[sl].to(device))
+            acc_rf.add(recon, alpha_true)
+            acc_re.add(exact, alpha_true)
+            preds.append(bp_phys.detach().cpu().numpy())
+    pm = cv_param_metrics(b_te, np.concatenate(preds, axis=0), cv_group_ids[te_idx])
+
+    row = {"fold": k + 1, "n_train_sets": int(len(g_tr)), "n_test_sets": int(len(g_te)),
+           "n_train_curves": int(len(tr_idx)), "n_test_curves": int(len(te_idx)),
+           "fwd_alpha_RMSE": acc_fwd.rmse(), "fwd_alpha_MAE": acc_fwd.mae(), "fwd_alpha_R2": acc_fwd.r2(),
+           "recon_fwd_RMSE": acc_rf.rmse(), "recon_fwd_MAE": acc_rf.mae(), "recon_fwd_R2": acc_rf.r2(),
+           "recon_exact_RMSE": acc_re.rmse(), "recon_exact_MAE": acc_re.mae(), "recon_exact_R2": acc_re.r2(),
+           **{f"inv_{key}": v for key, v in pm.items()},
+           "final_train_loss_forward": fwd_hist[-1], "final_train_loss_inverse": inv_hist[-1],
+           "minutes": (time.time() - t_start) / 60.0}
+    core = inv._orig_mod if hasattr(inv, "_orig_mod") else inv
+    torch.save({"forward_state_dict": fwd.state_dict(), "inverse_state_dict": core.state_dict(),
+                "branch_mean": bm, "branch_std": bs, "trunk_mean": tm, "trunk_std": ts,
+                "held_out_group_ids": g_te, "fold": k + 1}, cv_fold_path(k, "models.pt"))
+    with open(cv_fold_path(k, "history.json"), "w") as fh:
+        json.dump({"forward_train_loss": fwd_hist, "inverse_train_loss": inv_hist}, fh)
+    with open(cv_fold_path(k, "metrics.json"), "w") as fh:
+        json.dump({**row, "config": CV_FINGERPRINT}, fh, indent=2)
+    print(f"  fold {k + 1} done in {row['minutes']:.1f} min | fwd alpha RMSE {row['fwd_alpha_RMSE']:.4e} | "
+          f"exact-curve RMSE {row['recon_exact_RMSE']:.4e} | E RMSE {row['inv_E_kJ_mol_RMSE']:.3f} kJ/mol")
+    del fwd, inv, basis_tr, basis_te, T_bn_tr, T_tn_tr, T_al_tr, T_bn_te, T_tn_te, T_al_te
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+    return row
+
+
+def cv_reference_row(res, tr_mean, tr_std):
+    """Score the existing final model's 10 % grouped test set (notebook `results['Test']`, a <=10,000-curve
+    subsample) with the same metrics, for a like-for-like row in the table. Curve level only."""
+    r = res["Test"]
+    n = len(r["alpha_true"])
+    t_phys = np.asarray(r["trunk_norm"]) * np.asarray(tr_std) + np.asarray(tr_mean)
+    pm = cv_param_metrics(r["branch_true_phys"], r["branch_pred_phys"], None)
+    acc_rf, acc_re = _CvAcc(), _CvAcc()
+    acc_rf.add(r["alpha_pred"], r["alpha_true"])
+    with torch.no_grad():
+        for i in range(0, n, CV_INV_BATCH):
+            sl = slice(i, i + CV_INV_BATCH)
+            bp = torch.as_tensor(np.asarray(r["branch_pred_phys"][sl]), dtype=torch.float32, device=device)
+            tp = torch.as_tensor(t_phys[sl], dtype=torch.float32, device=device)
+            acc_re.add(cv_daem_alpha(bp, tp), r["alpha_true"][sl])
+    return {"fold": "final model (90/10 test subsample, best epoch)", "n_test_curves": n,
+            "recon_fwd_RMSE": acc_rf.rmse(), "recon_exact_RMSE": acc_re.rmse(),
+            **{f"inv_{key}": v for key, v in pm.items()}}
+
+
+# ----------------------------- RUN -----------------------------
+os.makedirs(CV_DIR, exist_ok=True)
+_cv_d = np.load(CV_DATA_PATH)
+_cv_missing_keys = [kk for kk in ("branch", "trunk", "alpha") if kk not in _cv_d.files]
+if _cv_missing_keys:
+    raise KeyError(f"{CV_DATA_PATH} has keys {list(_cv_d.files)}; missing {_cv_missing_keys}. "
+                   "Point DATA_PATH at forward_dataset_canonical.npz (physical branch / trunk / alpha).")
+cv_branch = _cv_d["branch"].astype(np.float32)       # (N, 9)  physical
+cv_trunk = _cv_d["trunk"].astype(np.float32)         # (N, 300, 2) physical t, beta
+cv_alpha = _cv_d["alpha"].astype(np.float32)         # (N, 300)
+cv_validate_dataset(cv_branch, cv_trunk, cv_alpha, CV_DATA_PATH)
+print(f"Dataset OK: {CV_DATA_PATH}")
+cv_n_groups, cv_group_ids = cv_make_group_ids(cv_branch)
+cv_fold_of_group = cv_assign_folds(cv_n_groups, CV_N_FOLDS, CV_SEED)
+cv_fold_of_curve = cv_fold_of_group[cv_group_ids]
+CV_FINGERPRINT = cv_fingerprint(len(cv_branch), cv_n_groups, cv_fold_of_group, CV_DATA_PATH)
+np.savez(os.path.join(CV_DIR, "kfold_fold_assignment.npz"), fold_of_group=cv_fold_of_group,
+         group_ids=cv_group_ids, seed=CV_SEED)
+print(f"{len(cv_branch)} curves, {cv_n_groups} unique parameter sets; "
+      f"sets per fold: {np.bincount(cv_fold_of_group, minlength=CV_N_FOLDS).tolist()}")
+print(f"Output folder (nothing outside it is written): {CV_DIR}")
+
+cv_rows = []
+for _k in (CV_FOLDS_TO_RUN if CV_FOLDS_TO_RUN is not None else range(CV_N_FOLDS)):
+    _mp = cv_fold_path(_k, "metrics.json")
+    _reuse = None
+    if os.path.isfile(_mp):
+        with open(_mp) as _fh:
+            _saved = json.load(_fh)
+        if not CV_RESUME:
+            print(f"Fold {_k + 1}: existing results found and CV_RESUME=False -> retraining and overwriting.")
+        elif _saved.get("config") != CV_FINGERPRINT:
+            print(f"Fold {_k + 1}: existing results were made with different settings/code/data -> retraining.")
+        else:
+            _saved.pop("config", None)
+            _reuse = _saved
+            print(f"Fold {_k + 1}: reusing saved results (identical settings fingerprint): {_mp}")
+    cv_rows.append(_reuse if _reuse is not None else cv_run_fold(_k))
+    pd.DataFrame(cv_rows).to_csv(os.path.join(CV_DIR, "kfold_fold_metrics.csv"), index=False)
+
+cv_folds_df, cv_table_df = cv_summarize(cv_rows)
+cv_table_df.to_csv(os.path.join(CV_DIR, "kfold_summary.csv"), index=False)
+
+_fmt = lambda s: f"{s.mean():.4g} ± {s.std(ddof=1) if len(s) > 1 else 0.0:.2g}"
+cv_paper = pd.DataFrame({label: [*(f"{v:.4g}" for v in cv_folds_df[col]), _fmt(cv_folds_df[col])]
+                         for col, label in CV_TABLE_COLS if col in cv_folds_df})
+cv_paper.insert(0, "Fold", [*(str(f) for f in cv_folds_df["fold"]), "mean ± SD"])
+cv_paper.to_csv(os.path.join(CV_DIR, "kfold_paper_table.csv"), index=False)
+print("\nGrouped CV over parameter sets (held-out fold, final epoch):")
+print(cv_paper.to_string(index=False))
+
+_cv_res = globals().get("results")        # defined by an earlier notebook cell; may not exist
+if CV_ADD_REFERENCE_ROW and isinstance(_cv_res, dict) and "Test" in _cv_res:
+    try:
+        cv_ref = cv_reference_row(_cv_res, globals()["trunk_mean"], globals()["trunk_std"])
+        pd.DataFrame([cv_ref]).to_csv(os.path.join(CV_DIR, "kfold_reference_final_model_row.csv"), index=False)
+        print("\nReference: your existing final model on its own 90/10 test subsample (same metric definitions):")
+        print({k: (f"{v:.4g}" if isinstance(v, float) else v) for k, v in cv_ref.items()})
+    except Exception as exc:
+        print("\nReference row skipped:", repr(exc))
+try:
+    _cv_png = cv_plot_histories(cv_folds_df["fold"].tolist())
+    if _cv_png:
+        print("Training-loss plot:", _cv_png)
+except Exception as exc:
+    print("Training-loss plot skipped:", repr(exc))
+print("\nSaved to:", CV_DIR)
