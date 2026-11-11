@@ -1,0 +1,438 @@
+# real-TGA multi-start and data-perturbation Monte Carlo.
+
+
+import os
+import numpy as np
+import pandas as pd
+import torch
+COLUMN_TEMP = "Temperature"
+COLUMN_WEIGHT = "Weight"
+
+def clean_tga_excel(path):
+    """Load the notebook's TGA Excel layout and discard its units row."""
+    df = pd.read_excel(path)
+    df.columns = [str(c).strip() for c in df.columns]
+    missing = [c for c in (COLUMN_TEMP, COLUMN_WEIGHT) if c not in df.columns]
+    if missing:
+        raise ValueError(f"{path}: missing columns {missing}; found {list(df.columns)}")
+    for col in (COLUMN_TEMP, COLUMN_WEIGHT):
+        df[col] = pd.to_numeric(
+            df[col].astype(str).str.replace(",", "", regex=False).str.strip(),
+            errors="coerce"
+        )
+    return (df.dropna(subset=[COLUMN_TEMP, COLUMN_WEIGHT])
+              .sort_values(COLUMN_TEMP).reset_index(drop=True))
+
+# --------------------------- SETTINGS ---------------------------
+BIOMASS_FILES = {
+    "Coconut_shell": {
+        5:  r"coconut shell 5 C min.xlsx",
+        15: r"coconut shell 15 C min.xlsx",
+        25: r"coconut shell 25 C min.xlsx",
+    },
+    "Date_seeds": {
+        5:  r"date seeds 5 C min.xlsx",
+        15: r"date seeds 15 C min.xlsx",
+        25: r"date seeds 25 C min.xlsx",
+    },
+    "Pistachio_shell": {
+        5:  r"pistachio shell 5 C min.xlsx",
+        15: r"pistachio shell 15 C min.xlsx",
+        25: r"pistachio shell 25 C min.xlsx",
+    },
+}
+USE_SURROGATE = False
+TEMP_WINDOW = (400.0, 900.0)
+
+N_MC_DRAWS = 50
+N_RANDOM_STARTS = 20       # plus one CNN start; increase after an exploratory run
+MULTISTART_STEPS = 1500
+MC_STEPS = 1500
+BASE_SEED = 20261029
+EQUIVALENCE_FACTOR = 1.05  # equivalent if experimental-point RMSE <= 1.05 * best RMSE
+MASS_NOISE_SD_RANGE_MG = (0.001, 0.009)
+INITIAL_SAMPLE_MASS_MG = 3.0
+
+TEMP_SHIFT_BOUND_C = 2.0
+
+# ---------------------- INPUT VALIDATION ----------------------
+if USE_SURROGATE and "forward_model" not in globals():
+    raise NameError("USE_SURROGATE=True requires the frozen forward_model loaded in the notebook.")
+missing_paths = [
+    f"{material}, beta={beta}: {path}"
+    for material, fmap in BIOMASS_FILES.items()
+    for beta, path in fmap.items()
+    if not os.path.isfile(path)
+]
+if missing_paths:
+    raise FileNotFoundError(
+        "Fix/remove these workbook entries before starting; no fits have been run:\n" +
+        "\n".join(missing_paths)
+    )
+if len(MASS_NOISE_SD_RANGE_MG) != 2 or not (0 < MASS_NOISE_SD_RANGE_MG[0] <= MASS_NOISE_SD_RANGE_MG[1]):
+    raise ValueError("MASS_NOISE_SD_RANGE_MG must be two positive values in ascending order.")
+if INITIAL_SAMPLE_MASS_MG <= 0:
+    raise ValueError("INITIAL_SAMPLE_MASS_MG must be positive.")
+if not (0 < EQUIVALENCE_FACTOR):
+    raise ValueError("EQUIVALENCE_FACTOR must be positive.")
+os.makedirs(SAVE_DIR, exist_ok=True)
+
+LOGA_BOUNDS = (10.0, 17.0)
+E_KJ_BOUNDS = (180.0, 380.0)
+R_GAS, T0_K = 8.314, 273.15
+T_REF_K = float(np.mean(TEMP_WINDOW)) + 273.15
+MODEL_TAG = "DeepONet" if USE_SURROGATE else "ExactDAEM"
+
+def mass_noise_sd_wt_percent(sd_mg):
+    """Convert absolute mass SD (mg) to SD in a mass-percentage column."""
+    return 100.0 * float(sd_mg) / INITIAL_SAMPLE_MASS_MG
+
+def prepare_real_curves(file_map, weight_noise_sd=None, rng=None):
+    """Read curves; perturb raw Weight if requested, then convert/interpolate."""
+    curves = []
+    noise_sigmas = {}
+    for beta, path in file_map.items():
+        df = clean_tga_excel(path)
+        temp = df["Temperature"].to_numpy(dtype=np.float64)
+        weight = df["Weight"].to_numpy(dtype=np.float64)
+        keep = (temp >= TEMP_WINDOW[0]) & (temp <= TEMP_WINDOW[1])
+        temp, weight = temp[keep], weight[keep]
+        if len(temp) < 20:
+            raise ValueError(f"{path}: fewer than 20 points inside TEMP_WINDOW={TEMP_WINDOW}.")
+
+        
+        sigma = float(np.mean(MASS_NOISE_SD_RANGE_MG))
+        noise_sigmas[float(beta)] = sigma
+        if weight_noise_sd is not None:
+            # Perturb every raw point, including window endpoints; endpoint uncertainty
+            # propagates through alpha normalization, as it does in the measurement.
+            weight = weight + rng.normal(0.0, weight_noise_sd, size=weight.shape)
+
+        w0, wf = float(weight[0]), float(weight[-1])
+        if abs(w0 - wf) < 1e-12:
+            raise ValueError(f"{path}: mass change is too small to calculate conversion.")
+        alpha = np.clip((w0 - weight) / (w0 - wf), 0.0, 1.0)
+        
+        if weight_noise_sd is None:
+            use_projection = True
+        else:
+            window_mass_loss = abs(w0 - wf)
+            use_projection = (weight_noise_sd / max(window_mass_loss, 1e-12)) <= 0.003
+        if use_projection:
+            alpha = np.maximum.accumulate(alpha)
+
+        t_exp = temp / float(beta)  # matches notebook convention T(C)=beta*t
+        order = np.argsort(t_exp)
+        t_exp, alpha = t_exp[order], alpha[order]
+        t_unique, idx = np.unique(t_exp, return_index=True)
+        alpha_unique = alpha[idx]
+        tg = np.asarray(t_grid, dtype=np.float64)
+        alpha_grid = np.interp(tg, t_unique, alpha_unique,
+                               left=alpha_unique[0], right=alpha_unique[-1])
+        trunk_phys = np.column_stack([
+            np.asarray(t_grid, dtype=np.float32),
+            np.full(len(t_grid), float(beta), dtype=np.float32)
+        ])
+        trunk_norm = ((trunk_phys - trunk_mean) / trunk_std).astype(np.float32)
+        curves.append({
+            "beta": float(beta), "alpha_grid": alpha_grid.astype(np.float32),
+            "t_exp": t_exp.astype(np.float64), "alpha_exp": alpha.astype(np.float64),
+            "trunk_norm": trunk_norm, "sigma_mass": sigma,
+            "monotone_projection": bool(use_projection),
+        })
+    return curves, noise_sigmas
+
+
+def cnn_initial_guess(curves):
+    """Average CNN guesses after sorting components by E to prevent label mixing."""
+    net = inverse_model._orig_mod if hasattr(inverse_model, "_orig_mod") else inverse_model
+    net.eval()
+    guesses = []
+    with torch.no_grad():
+        for cu in curves:
+            tr = torch.as_tensor(cu["trunk_norm"][None], dtype=torch.float32, device=device)
+            al = torch.as_tensor(cu["alpha_grid"][None], dtype=torch.float32, device=device)
+            _, phys = net(tr, al)
+            p = phys.squeeze(0).cpu().numpy()
+            comps = p.reshape(3, 3)
+            guesses.append(comps[np.argsort(comps[:, 1])].reshape(-1))
+    p = np.mean(guesses, axis=0).astype(np.float64)
+    c = np.clip(p[[2, 5, 8]], 1e-8, None)
+    p[[2, 5, 8]] = c / c.sum()
+    return p
+
+
+def pack_params(logA, E_kJ, c):
+    p = torch.empty(9, dtype=logA.dtype, device=device)
+    p[[0, 3, 6]], p[[1, 4, 7]], p[[2, 5, 8]] = logA, E_kJ, c
+    return p
+
+
+def alpha_exact_daem(branch, beta):
+    t = torch.as_tensor(np.asarray(t_grid), dtype=torch.float32, device=device)
+    temp_k = T0_K + float(beta) * t
+    logA, E = branch[[0, 3, 6]], branch[[1, 4, 7]] * 1000.0
+    c = branch[[2, 5, 8]]
+    A = torch.pow(torch.tensor(10.0, device=device), logA)
+    k = A[None, :] * torch.exp(-E[None, :] / (R_GAS * temp_k[:, None]))
+    dt = t[1:] - t[:-1]
+    integral = torch.cat([
+        torch.zeros((1, 3), dtype=torch.float32, device=device),
+        torch.cumsum(0.5 * (k[1:] + k[:-1]) * dt[:, None], dim=0)
+    ], dim=0)
+    return torch.sum(c[None, :] * (1.0 - torch.exp(-integral)), dim=1)
+
+
+def alpha_surrogate(branch, beta):
+    branch_t = branch.reshape(1, 9)
+    bmean = torch.as_tensor(branch_mean, dtype=torch.float32, device=device)
+    bstd = torch.as_tensor(branch_std, dtype=torch.float32, device=device)
+    branch_norm = (branch_t - bmean) / bstd
+    trunk_phys = np.column_stack([
+        np.asarray(t_grid, dtype=np.float32),
+        np.full(len(t_grid), float(beta), dtype=np.float32)
+    ])
+    trunk_norm = torch.as_tensor(((trunk_phys - trunk_mean) / trunk_std)[None],
+                                 dtype=torch.float32, device=device)
+    return forward_model(branch_norm, trunk_norm).reshape(-1)
+
+
+def predict_grid(branch, beta):
+    return alpha_surrogate(branch, beta) if USE_SURROGATE else alpha_exact_daem(branch, beta)
+
+
+def decode_raw(raw_logA, raw_E, raw_c):
+    logA = LOGA_BOUNDS[0] + (LOGA_BOUNDS[1] - LOGA_BOUNDS[0]) * torch.sigmoid(raw_logA)
+    E = E_KJ_BOUNDS[0] + (E_KJ_BOUNDS[1] - E_KJ_BOUNDS[0]) * torch.sigmoid(raw_E)
+    return pack_params(logA, E, torch.softmax(raw_c, dim=0))
+
+
+def encode_start(p):
+    p = np.asarray(p, dtype=np.float64).copy()
+    c = np.clip(p[[2, 5, 8]], 1e-8, None); c /= c.sum()
+    la = np.clip((p[[0, 3, 6]] - LOGA_BOUNDS[0]) / (LOGA_BOUNDS[1] - LOGA_BOUNDS[0]), 1e-6, 1-1e-6)
+    ee = np.clip((p[[1, 4, 7]] - E_KJ_BOUNDS[0]) / (E_KJ_BOUNDS[1] - E_KJ_BOUNDS[0]), 1e-6, 1-1e-6)
+    logit = lambda x: np.log(x / (1.0 - x))
+    return tuple(torch.tensor(v, dtype=torch.float32, device=device, requires_grad=True)
+                 for v in (logit(la), logit(ee), np.log(c)))
+
+
+def interp_grid_torch(y_grid, t_exp):
+    """Differentiable linear interpolation from model grid to measured times."""
+    tg = torch.as_tensor(np.asarray(t_grid), dtype=torch.float32, device=device)
+    te = torch.as_tensor(np.asarray(t_exp), dtype=torch.float32, device=device)
+    idx = torch.searchsorted(tg, te).clamp(1, len(tg) - 1)
+    left, right = idx - 1, idx
+    frac = (te - tg[left]) / (tg[right] - tg[left])
+    return y_grid[left] + frac * (y_grid[right] - y_grid[left])
+
+
+def experimental_point_metrics(branch, curves):
+    """Evaluate only measured points in the selected temperature window (no padding)."""
+    per_curve = []
+    with torch.no_grad():
+        for cu in curves:
+            pred_grid = predict_grid(torch.as_tensor(branch, dtype=torch.float32, device=device), cu["beta"]).cpu().numpy()
+            pred_exp = np.interp(cu["t_exp"], np.asarray(t_grid), pred_grid)
+            err = pred_exp - cu["alpha_exp"]
+            per_curve.append({"beta": cu["beta"], "RMSE": float(np.sqrt(np.mean(err**2))),
+                              "MAE": float(np.mean(np.abs(err))), "n_points": len(err)})
+    # Macro-averaging gives each heating rate equal weight despite unequal point counts.
+    macro_rmse = float(np.sqrt(np.mean([x["RMSE"]**2 for x in per_curve])))
+    return macro_rmse, per_curve
+
+
+def fit_from_start(curves, p_start, steps):
+    raw_logA, raw_E, raw_c = encode_start(p_start)
+    opt = torch.optim.AdamW([raw_logA, raw_E, raw_c], lr=0.03, weight_decay=1e-4)
+    sched = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=int(steps), eta_min=0.001)
+    best_loss, best_p = float("inf"), None
+    for _ in range(int(steps)):
+        opt.zero_grad(set_to_none=True)
+        p = decode_raw(raw_logA, raw_E, raw_c)
+        # Fit only measured in-window points, equally weighting each heating rate.
+        losses = []
+        for cu in curves:
+            pred_exp = interp_grid_torch(predict_grid(p, cu["beta"]), cu["t_exp"])
+            target_exp = torch.as_tensor(cu["alpha_exp"], dtype=torch.float32, device=device)
+            losses.append(torch.mean((pred_exp - target_exp) ** 2))
+        # No CNN-anchor penalty: multi-start must reveal data-supported alternatives.
+        loss = torch.stack(losses).mean()
+        loss.backward()
+        opt.step(); sched.step()
+        if loss.item() < best_loss:
+            best_loss, best_p = loss.item(), p.detach().clone()
+    p_np = best_p.cpu().numpy()
+    comps = p_np.reshape(3, 3)
+    p_np = comps[np.argsort(comps[:, 1])].reshape(-1)
+    rmse, per_curve = experimental_point_metrics(p_np, curves)
+    return p_np, float(best_loss), rmse, per_curve
+
+
+def random_start(rng):
+    p = np.zeros(9, dtype=np.float64)
+    p[[0, 3, 6]] = rng.uniform(*LOGA_BOUNDS, size=3)
+    p[[1, 4, 7]] = rng.uniform(*E_KJ_BOUNDS, size=3)
+    p[[2, 5, 8]] = rng.dirichlet(np.ones(3))
+    comps = p.reshape(3, 3); return comps[np.argsort(comps[:, 1])].reshape(-1)
+
+
+def result_row(material, run, start_type, p, fit_mse, exp_rmse, per_curve, sigmas):
+    row = {"material": material, "run": run, "start_type": start_type,
+           "model": MODEL_TAG, "experimental_MSE_objective": fit_mse,
+           "experimental_macro_RMSE": exp_rmse,
+           "T_ref_C": T_REF_K - 273.15}
+    for j in range(3):
+        logA, E, c = p[3*j:3*j+3]
+        row[f"logA{j+1}"] = logA; row[f"E{j+1}_kJ_mol"] = E; row[f"c{j+1}"] = c
+        row[f"ln_k{j+1}_at_Tref"] = np.log(10.0) * logA - E*1000.0/(R_GAS*T_REF_K)
+    for item in per_curve:
+        b = int(item["beta"])
+        row[f"RMSE_beta_{b}"] = item["RMSE"]
+        row[f"MAE_beta_{b}"] = item["MAE"]
+        row[f"n_beta_{b}"] = item["n_points"]
+    for beta, sigma in sigmas.items(): row[f"mass_noise_sigma_beta_{int(beta)}_mg"] = sigma
+    return row
+
+
+def append_row(path, row):
+    pd.DataFrame([row]).to_csv(path, mode="a", header=not os.path.exists(path), index=False)
+
+
+# ----------------------------- RUN -----------------------------
+rng = np.random.default_rng(BASE_SEED)
+multistart_path = os.path.join(SAVE_DIR, f"real_TGA_multistart_{MODEL_TAG}.csv")
+mc_path = os.path.join(SAVE_DIR, f"real_TGA_perturbation_MC_{MODEL_TAG}.csv")
+multi_summary_path = os.path.join(SAVE_DIR, f"real_TGA_multistart_summary_{MODEL_TAG}.csv")
+summary_path = os.path.join(SAVE_DIR, f"real_TGA_MC_summary_{MODEL_TAG}.csv")
+for path in (multistart_path, mc_path, summary_path, multi_summary_path):
+    if os.path.exists(path): os.remove(path)
+
+all_mc_rows = []
+for material, fmap in BIOMASS_FILES.items():
+    print(f"\n=== {material} | model={MODEL_TAG} ===")
+    base_curves, base_sigmas = prepare_real_curves(fmap)
+    print("Literature midpoint mass-noise SD (mg):", base_sigmas)
+    print("Mass-noise SD range (mg):", MASS_NOISE_SD_RANGE_MG,
+          "| temperature offset range (°C):",
+          (-TEMP_SHIFT_BOUND_C, TEMP_SHIFT_BOUND_C))
+    p_cnn = cnn_initial_guess(base_curves)
+
+    # A) Multi-start on original measured curves: CNN start plus random parameter starts.
+    starts = [("CNN", p_cnn)] + [(f"random_{i+1}", random_start(rng)) for i in range(N_RANDOM_STARTS)]
+    material_multi = []
+    for run_i, (label, p0) in enumerate(starts):
+        p, fit_mse, exp_rmse, per_curve = fit_from_start(base_curves, p0, MULTISTART_STEPS)
+        row = result_row(material, run_i, label, p, fit_mse, exp_rmse, per_curve, base_sigmas)
+        append_row(multistart_path, row); material_multi.append(row)
+        print(f"multi-start {run_i+1}/{len(starts)} {label}: experimental macro-RMSE={exp_rmse:.6g}")
+
+    
+    best = min(x["experimental_macro_RMSE"] for x in material_multi)
+    equivalent = [x for x in material_multi
+                  if x["experimental_macro_RMSE"] <= best * EQUIVALENCE_FACTOR + 1e-12]
+    eq_df = pd.DataFrame(equivalent)
+    print(f"{material}: best RMSE={best:.6g}; equivalent starts={len(equivalent)}/{len(starts)} "
+          f"(tolerance={EQUIVALENCE_FACTOR:.3f} x best)")
+
+    PARAM_COLS = ([f"logA{j}" for j in range(1, 4)]
+                  + [f"c{j}" for j in range(1, 4)]
+                  + [f"ln_k{j}_at_Tref" for j in range(1, 4)]
+                  + [f"E{j}_kJ_mol" for j in range(1, 4)])
+    equivalent_param_cols = param_cols = PARAM_COLS
+    equivalent_sd = eq_df[equivalent_param_cols].std(ddof=1)
+    multi_summary = {"material": material, "model": MODEL_TAG, "best_experimental_macro_RMSE": best,
+                     "equivalence_factor": EQUIVALENCE_FACTOR, "equivalent_start_count": len(equivalent),
+                     "total_start_count": len(starts)}
+    multi_summary.update({f"{col}_SD_among_equivalent": equivalent_sd[col] for col in equivalent_param_cols})
+    for j in range(1, 4):
+        multi_summary[f"corr_logA{j}_E{j}_equivalent"] = (eq_df[[f"logA{j}", f"E{j}_kJ_mol"]].corr().iloc[0, 1] if len(eq_df) > 1 else np.nan)
+    append_row(multi_summary_path, multi_summary)
+    
+    mc_rows_material = []
+    for draw in range(N_MC_DRAWS):
+        draw_rng = np.random.default_rng(BASE_SEED + 10000 + draw)
+        # Sample one published mass-SD level in mg and perturb the absolute-mass
+        # column selected by COLUMN_WEIGHT. Conversion is then recomputed from it.
+        perturbed = []
+        draw_sigmas = {}
+        draw_temp_shifts = {}
+        for beta, path in fmap.items():
+            df = clean_tga_excel(path)
+            temp = df["Temperature"].to_numpy(dtype=np.float64)
+            weight = df["Weight"].to_numpy(dtype=np.float64)
+            keep = (temp >= TEMP_WINDOW[0]) & (temp <= TEMP_WINDOW[1])
+            weight = weight[keep]
+            temp = temp[keep]
+            temp_shift_c = float(draw_rng.uniform(-TEMP_SHIFT_BOUND_C, TEMP_SHIFT_BOUND_C))
+            draw_temp_shifts[float(beta)] = temp_shift_c
+            sigma_mg = float(draw_rng.uniform(*MASS_NOISE_SD_RANGE_MG))
+            sigma_pct_points = mass_noise_sd_wt_percent(sigma_mg)
+            draw_sigmas[float(beta)] = sigma_mg  # saved with mg units in result_row
+            noisy_weight = weight + draw_rng.normal(0.0, sigma_pct_points, size=weight.shape)
+            
+            alpha = np.clip((noisy_weight[0] - noisy_weight) / (noisy_weight[0] - noisy_weight[-1]), 0.0, 1.0)
+            window_mass_loss = abs(noisy_weight[0] - noisy_weight[-1])
+            if sigma_pct_points / max(window_mass_loss, 1e-12) <= 0.003:
+                alpha = np.maximum.accumulate(alpha)
+            
+            t_exp = (temp + temp_shift_c) / float(beta); order = np.argsort(t_exp); t_exp, alpha = t_exp[order], alpha[order]
+            t_unique, idx = np.unique(t_exp, return_index=True); alpha_unique = alpha[idx]
+            alpha_grid = np.interp(np.asarray(t_grid), t_unique, alpha_unique,
+                                   left=alpha_unique[0], right=alpha_unique[-1])
+            trunk_phys = np.column_stack([np.asarray(t_grid, dtype=np.float32),
+                                          np.full(len(t_grid), float(beta), dtype=np.float32)])
+            perturbed.append({"beta": float(beta), "alpha_grid": alpha_grid.astype(np.float32),
+                              "t_exp": t_exp, "alpha_exp": alpha,
+                              "trunk_norm": ((trunk_phys-trunk_mean)/trunk_std).astype(np.float32),
+                               "sigma_mass": sigma_pct_points})
+        p0 = cnn_initial_guess(perturbed)
+        p, fit_mse, exp_rmse, per_curve = fit_from_start(perturbed, p0, MC_STEPS)
+        row = result_row(material, draw, "CNN_initialized_refinement", p,
+                         fit_mse, exp_rmse, per_curve, draw_sigmas)
+        for beta, shift_c in draw_temp_shifts.items():
+            row[f"temp_shift_beta_{int(beta)}_C"] = shift_c
+        append_row(mc_path, row); mc_rows_material.append(row)
+        if (draw + 1) % 10 == 0:
+            print(f"Monte Carlo {draw+1}/{N_MC_DRAWS}: experimental macro-RMSE={exp_rmse:.6g}")
+    all_mc_rows.extend(mc_rows_material)
+
+    # Per-material Monte Carlo percentile summary, saved before moving to next material.
+    sub = pd.DataFrame(mc_rows_material)
+    param_cols = PARAM_COLS
+    summary = pd.DataFrame({
+        "parameter": param_cols,
+        "median": [sub[c].median() for c in param_cols],
+        "p05": [sub[c].quantile(.05) for c in param_cols],
+        "p95": [sub[c].quantile(.95) for c in param_cols],
+        "SD": [sub[c].std(ddof=1) for c in param_cols],
+    })
+    summary.insert(0, "material", material)
+    summary.insert(1, "model", MODEL_TAG)
+    for j in range(1, 4):
+        corr = sub[[f"logA{j}", f"E{j}_kJ_mol"]].corr().iloc[0, 1] if len(sub) > 1 else np.nan
+        summary[f"corr_logA{j}_E{j}"] = corr
+    summary.to_csv(summary_path, mode="a", header=not os.path.exists(summary_path), index=False)
+
+    # Correlations expose A-E trade-off descriptively across equivalent starts / MC draws.
+    for label, frame in (("equivalent_multistarts", eq_df), ("MC_draws", sub)):
+        print(f"{material} {label} logA-E correlations by sorted component:")
+        for j in range(1, 4):
+            a, e = f"logA{j}", f"E{j}_kJ_mol"
+            corr = frame[[a, e]].corr().iloc[0, 1] if len(frame) > 1 else np.nan
+            print(f"  component {j}: r={corr:.4f}")
+
+print("\nCompleted. Incremental outputs:")
+print(multistart_path)
+print(mc_path)
+print(os.path.join(SAVE_DIR, f"real_TGA_MC_summary_{MODEL_TAG}.csv"))
+print(multi_summary_path)
+
+
+
+
+
+
+
+
+
